@@ -789,7 +789,7 @@ def main() -> None:
         help="Cleaned JSON path (default: newest *.cleaned.json in processing/)",
     )
     parser.add_argument("-o", "--output", type=Path, help="Output XLSX path")
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
 
     if args.cleaned:
         cleaned_path = args.cleaned
