@@ -11,7 +11,7 @@ from pathlib import Path
 
 from build_matrix import build_matrix, build_matrix_workbook
 from clean_di_json import write_cleaned_json
-from file_selection import resolve_input_json
+from file_selection import prompt_input_json, resolve_input_json
 from project_paths import OUTPUT_DIR, PROCESSING_DIR, ensure_workspace_dirs, is_colab_environment
 
 _IN_COLAB = is_colab_environment()
@@ -47,7 +47,10 @@ def run_matrix_step(cleaned_path: Path, output_path: Path | None = None) -> Path
 def run_pipeline(source_path: Path | None = None) -> PipelineResult:
     ensure_workspace_dirs()
 
-    source_path = resolve_input_json(source_path)
+    if source_path is None:
+        source_path = prompt_input_json()
+    else:
+        source_path = resolve_input_json(source_path)
 
     print("\n[1/2] Cleaning Document Intelligence JSON...")
     print(f"      Source: {source_path}")
