@@ -22,15 +22,6 @@ def resolve_input_json(path: Path | None = None) -> Path:
         if not resolved.is_file():
             raise FileNotFoundError(f"Input file not found: {resolved}")
         return resolved
-
-    files = list_input_json_files()
-    if not files:
-        raise FileNotFoundError(
-            f"No JSON files found in {INPUT_DIR}. "
-            "Place Azure Document Intelligence exports there first."
-        )
-    if len(files) == 1:
-        return files[0]
     return prompt_input_json()
 
 
