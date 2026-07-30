@@ -161,7 +161,7 @@ def main() -> None:
         type=Path,
         help="Output path (default: processing/<stem>.cleaned.json)",
     )
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
 
     source = resolve_input_json(args.input)
     dest = args.output or (PROCESSING_DIR / f"{source.stem}.cleaned.json")
