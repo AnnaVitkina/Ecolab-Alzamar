@@ -36,18 +36,19 @@ SHIPMENT_HEADERS = [
     "Destination Postal Code Zone",
 ]
 
-ORIGIN_BARCELONA = "ES Barcelona"
-ORIGIN_TENERIFE_WH = "ES Tenerife (Almacén)"
+ORIGIN_BARCELONA = "Barcelona"
+ORIGIN_TENERIFE = "Tenerife"
+ORIGIN_MAINLAND_SPAIN = "Mainland Spain"
 INSURANCE_FCL_40_LABEL = (
     "l[100% - Shipment Insurance (Carga EN CELRA/CORAL'40)%]"
 )
 EMERGENCY_BUNKER_NOTE = "TBD"
 
 TENERIFE_DIST_BRACKETS = (
-    "Hasta 150 kg",
-    "Hasta 3000 kg",
-    "Mas de 3000 kg",
-    "Minimo",
+    "MIN",
+    "<=150",
+    "<=3000",
+    ">3000",
 )
 
 FCL_SIZE_BRACKETS = ("20 pies", "40 pies")
@@ -141,8 +142,8 @@ def _parse_euro(value: object) -> float | None:
         return None
 
 
-def _zone_label(place: str) -> str:
-    return f"ES {place.strip()}"
+def _place_label(place: str) -> str:
+    return place.strip()
 
 
 def _load_fields(path: Path) -> dict[str, Any]:
@@ -206,7 +207,7 @@ def _match_weight(weight: object, expected: str) -> bool:
 
 
 def _parse_fcl_table(section_rows: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, float | None]]:
-    """Map (origin, size) -> {cost1, cost2, cost3}."""
+    """Map (origin, size) -> {cost1: Arrastres/Flete, cost2: BAFF, cost3: Tarifa 2026}."""
     table: dict[tuple[str, str], dict[str, float | None]] = {}
     for row in section_rows:
         origin = _row_value(row, "Origin")
@@ -265,28 +266,47 @@ def _parse_tenerife_distribution(
         if not weight or price is None:
             continue
         w = str(weight).strip()
-        if _match_weight(w, "Hasta 150 kg"):
-            mapping["Hasta 150 kg"] = price
-        elif _match_weight(w, "Hasta 3000 kg"):
-            mapping["Hasta 3000 kg"] = price
-        elif "3000" in _norm_key(w) and "mas" in _norm_key(w):
-            mapping["Mas de 3000 kg"] = price
-        elif "minimo" in _norm_key(w):
-            mapping["Minimo"] = price
+        key = _norm_key(w)
+        if key in {_norm_key("MIN"), _norm_key("Minimo")} or (
+            "minimo" in key and "150" not in key and "3000" not in key
+        ):
+            mapping["MIN"] = price
+        elif w.startswith(">") or ("mas" in key and "3000" in key):
+            mapping[">3000"] = price
+        elif w.startswith("<=") and "150" in key:
+            mapping["<=150"] = price
+        elif w.startswith("<=") and "3000" in key:
+            mapping["<=3000"] = price
+        elif "150" in key and "3000" not in key and "mas" not in key:
+            mapping["<=150"] = price
+        elif "3000" in key and "mas" not in key:
+            mapping["<=3000"] = price
     return mapping
 
 
 def _parse_wh_distribution(
     section_rows: list[dict[str, Any]],
-) -> dict[str, float | None]:
-    rates: dict[str, float | None] = {}
+) -> dict[str, dict[str, float | None]]:
+    rates: dict[str, dict[str, float | None]] = {}
     for row in section_rows:
         dest = _row_value(row, "Weight")
-        price = _parse_euro(_row_value(row, "Price"))
-        if not dest or price is None:
+        per_kg = _parse_euro(_row_value(row, "Price"))
+        minimum = _parse_euro(_row_value(row, "MinPrice"))
+        if not dest:
             continue
-        rates[str(dest).strip()] = price
+        if per_kg is None and minimum is None:
+            continue
+        rates[str(dest).strip()] = {"per_kg": per_kg, "minimum": minimum}
     return rates
+
+
+def _excel_number_format(value: float) -> str:
+    """Preserve parsed decimals in Excel without rounding to two places."""
+    text = f"{value:.10f}".rstrip("0").rstrip(".")
+    decimals = len(text.split(".")[1]) if "." in text else 0
+    if decimals <= 2:
+        return "0.00" if decimals == 2 else "0.0" if decimals == 1 else "0"
+    return "0." + ("0" * decimals)
 
 
 def _parse_otros_conceptos(section_rows: list[dict[str, Any]]) -> dict[str, str | float | None]:
@@ -302,6 +322,75 @@ def _parse_otros_conceptos(section_rows: list[dict[str, Any]]) -> dict[str, str 
         elif "seguro" in key:
             data["insurance"] = str(price).strip() if price else None
     return data
+
+
+def _size_title_label(size: str) -> str:
+    return "20'" if "20" in _norm_key(size) else "40'"
+
+
+def _fcl_service_blocks(
+    service_label: str,
+    sizes: tuple[str, ...],
+    *,
+    default_apply: str,
+) -> list[CostBlock]:
+    blocks: list[CostBlock] = []
+    for size in sizes:
+        size_label = _size_title_label(size)
+        blocks.append(
+            CostBlock(
+                title=f"Transport cost ({service_label}, {size_label})",
+                apply_if=default_apply,
+                rate_by=(
+                    f"Rate by: Arrastres/Flete ({service_label}, {size_label})"
+                ),
+                columns=[CostColumnSpec("Flat", "Flat")],
+            )
+        )
+        blocks.append(
+            CostBlock(
+                title=f"BAF ({service_label}, {size_label})",
+                apply_if=default_apply,
+                rate_by=f"Rate by: BAFF ({service_label}, {size_label})",
+                columns=[CostColumnSpec("Flat", "Flat")],
+            )
+        )
+    return blocks
+
+
+def _blocks_by_title(cost_blocks: list[CostBlock]) -> dict[str, CostBlock]:
+    return {block.title: block for block in cost_blocks}
+
+
+def _set_flat_cost(
+    costs: dict[tuple[str, str], float | str | None],
+    block: CostBlock | None,
+    value: float | str | None,
+) -> None:
+    if block is None or not _has_cost(value):
+        return
+    costs[cost_key(block, block.columns[0])] = value
+
+
+def _assign_fcl_service_costs(
+    costs: dict[tuple[str, str], float | str | None],
+    blocks_by_title: dict[str, CostBlock],
+    table: dict[tuple[str, str], dict[str, float | None]],
+    service_label: str,
+    origin_name: str,
+    sizes: tuple[str, ...],
+) -> None:
+    for size in sizes:
+        row = table.get((origin_name, size))
+        if not row:
+            continue
+        size_label = _size_title_label(size)
+        transport_block = blocks_by_title.get(
+            f"Transport cost ({service_label}, {size_label})"
+        )
+        baf_block = blocks_by_title.get(f"BAF ({service_label}, {size_label})")
+        _set_flat_cost(costs, transport_block, row.get("cost1"))
+        _set_flat_cost(costs, baf_block, row.get("cost2"))
 
 
 def _cost_blocks() -> list[CostBlock]:
@@ -320,7 +409,11 @@ def _cost_blocks() -> list[CostBlock]:
             title="Transport cost (Envios)",
             apply_if=default_apply,
             rate_by="Rate by: Per kg (Distribución desde almacén Tenerife)",
-            columns=[CostColumnSpec("Flat", "Flat")],
+            columns=[
+                CostColumnSpec("MIN", "Flat"),
+                CostColumnSpec("Flat", "Per kg"),
+            ],
+            uses_shared_currency=True,
         ),
         CostBlock(
             title=(
@@ -337,26 +430,12 @@ def _cost_blocks() -> list[CostBlock]:
             rate_by="Rate by: Percent of freight",
             columns=[CostColumnSpec("Flat", "Flat")],
         ),
-        CostBlock(
-            title="Transport cost + BAF (Cargas EN CORAL)",
-            apply_if=default_apply,
-            rate_by="Rate by: Container (Carga en Coral, Tarifa 2026)",
-            columns=[CostColumnSpec(s, "Flat") for s in FCL_SIZE_BRACKETS],
-            uses_shared_currency=True,
-        ),
-        CostBlock(
-            title="Transport cost + BAF (Cargas EN CELRA)",
-            apply_if=default_apply,
-            rate_by="Rate by: Container (Carga en Celra, Tarifa 2026)",
-            columns=[CostColumnSpec(s, "Flat") for s in FCL_SIZE_BRACKETS],
-            uses_shared_currency=True,
-        ),
-        CostBlock(
-            title="Transport cost + BAF (CARGA EN CELRA / CORAL)",
-            apply_if=default_apply,
-            rate_by="Rate by: Container (Celra + Coral, Tarifa 2026)",
-            columns=[CostColumnSpec("40 pies", "Flat")],
-            uses_shared_currency=True,
+        *_fcl_service_blocks("Cargas EN CORAL", FCL_SIZE_BRACKETS, default_apply=default_apply),
+        *_fcl_service_blocks("Cargas EN CELRA", FCL_SIZE_BRACKETS, default_apply=default_apply),
+        *_fcl_service_blocks(
+            "CARGA EN CELRA / CORAL",
+            ("40 pies",),
+            default_apply=default_apply,
         ),
         CostBlock(
             title="Transport cost (Grupajes)",
@@ -369,40 +448,9 @@ def _cost_blocks() -> list[CostBlock]:
             uses_shared_currency=True,
         ),
         CostBlock(
-            title="BAF (CARGA EN CELRA / CORAL, 40)",
-            apply_if=default_apply,
-            rate_by="Rate by: BAF 40ft (Celra + Coral)",
-            columns=[CostColumnSpec("Flat", "Flat")],
-        ),
-        CostBlock(
-            title="BAF (20FT/40FT)",
-            apply_if=default_apply,
-            rate_by="Rate by: BAF by origin (Celra + Coral)",
-            columns=[
-                CostColumnSpec("20 pies", "Flat"),
-                CostColumnSpec("40 pies", "Flat"),
-            ],
-            uses_shared_currency=True,
-        ),
-        CostBlock(
             title="Emergency Bunker Surcharge",
             apply_if=default_apply,
             rate_by="Rate by: TBD",
-            columns=[CostColumnSpec("Flat", "Flat")],
-        ),
-        CostBlock(
-            title="BAF (40FT)",
-            apply_if=default_apply,
-            rate_by="Rate by: BAF 40ft (Celra + Coral)",
-            columns=[CostColumnSpec("Flat", "Flat")],
-        ),
-        CostBlock(
-            title=(
-                "Transport cost + BAF (CARGA EN CELRA / CORAL) "
-                "[by Origen]"
-            ),
-            apply_if=default_apply,
-            rate_by="Rate by: Tarifa 2026 by origin (Celra + Coral)",
             columns=[CostColumnSpec("Flat", "Flat")],
         ),
         CostBlock(
@@ -428,16 +476,25 @@ def _has_cost(value: float | str | None) -> bool:
     return value is not None and value != ""
 
 
+def _block_has_row_data(matrix_row: MatrixRow, block: CostBlock) -> bool:
+    for spec in block.columns:
+        key = cost_key(block, spec)
+        if key in matrix_row.text_costs:
+            return True
+        if _has_cost(matrix_row.costs.get(key)):
+            return True
+    return False
+
+
 def _build_lane_rows() -> list[tuple[str, str]]:
     lanes: list[tuple[str, str]] = []
     for dest in GRUPAJE_DESTINATIONS:
-        lanes.append((ORIGIN_BARCELONA, _zone_label(dest)))
+        lanes.append((ORIGIN_BARCELONA, _place_label(dest)))
     for dest in ISLAND_DESTINATIONS:
-        lanes.append((ORIGIN_TENERIFE_WH, _zone_label(dest)))
-    lanes.append((_zone_label("Tenerife"), _zone_label("Tenerife")))
-    for origin in FCL_ORIGINS:
-        zone = _zone_label(origin)
-        lanes.append((zone, zone))
+        lanes.append((ORIGIN_TENERIFE, _place_label(dest)))
+    lanes.append((ORIGIN_TENERIFE, ORIGIN_TENERIFE))
+    for port in FCL_ORIGINS:
+        lanes.append((ORIGIN_MAINLAND_SPAIN, _place_label(port)))
     return lanes
 
 
@@ -475,7 +532,16 @@ def build_matrix(
     insurance_cc = otros.get("insurance")
 
     cost_blocks = _cost_blocks()
+    blocks_by_title = _blocks_by_title(cost_blocks)
     matrix_rows: list[MatrixRow] = []
+
+    customs_block = blocks_by_title[
+        "Origin Customs Clearance (ALL) + Destination Customs Clearance "
+        "(Grupajes (Despacho Destino))"
+    ]
+    insurance_cc_block = blocks_by_title["Shipment Insurance (Cargas Completas (Seguro))"]
+    grupajes_block = blocks_by_title["Transport cost (Grupajes)"]
+    insurance_fcl_block = blocks_by_title["Shipment Insurance (Carga EN CELRA/CORAL'40)"]
 
     for origin_zone, dest_zone in _build_lane_rows():
         shipment = {
@@ -485,112 +551,81 @@ def build_matrix(
         costs: dict[tuple[str, str], float | str | None] = {}
         text_costs: dict[tuple[str, str], str] = {}
 
-        dest_name = dest_zone.replace("ES ", "", 1)
-        origin_name = origin_zone.replace("ES ", "", 1).replace(" (Almacén)", "")
+        dest_name = dest_zone
+        port_name = dest_zone
 
-        # Tenerife island distribution
-        if origin_zone == _zone_label("Tenerife") and dest_zone == _zone_label("Tenerife"):
+        # Tenerife island distribution (Distribución en la Isla de Tenerife)
+        if origin_zone == ORIGIN_TENERIFE and dest_zone == ORIGIN_TENERIFE:
             block = cost_blocks[0]
             for bracket in TENERIFE_DIST_BRACKETS:
                 costs[cost_key(block, CostColumnSpec(bracket))] = tenerife_dist.get(
                     bracket
                 )
 
-        # Warehouse distribution (envíos)
-        if origin_zone == ORIGIN_TENERIFE_WH:
+        # Warehouse distribution / envíos (Distribución desde almacén de Tenerife)
+        if origin_zone == ORIGIN_TENERIFE and dest_zone in ISLAND_DESTINATIONS:
             block = cost_blocks[1]
             for island in ISLAND_DESTINATIONS:
                 if _norm_key(island) == _norm_key(dest_name):
-                    costs[cost_key(block, block.columns[0])] = wh_dist.get(island)
+                    wh_rates = wh_dist.get(island) or {}
+                    costs[cost_key(block, block.columns[0])] = wh_rates.get("minimum")
+                    costs[cost_key(block, block.columns[1])] = wh_rates.get("per_kg")
                     break
 
         # Customs (flat on all rows when value present)
-        block = cost_blocks[2]
         if isinstance(customs, (int, float)):
-            costs[cost_key(block, block.columns[0])] = float(customs)
+            _set_flat_cost(costs, customs_block, float(customs))
         elif customs:
-            text_costs[cost_key(block, block.columns[0])] = str(customs)
+            text_costs[cost_key(customs_block, customs_block.columns[0])] = str(customs)
 
         # Shipment insurance completas
-        block = cost_blocks[3]
         if insurance_cc:
-            text_costs[cost_key(block, block.columns[0])] = str(insurance_cc)
-
-        # FCL Coral / Celra
-        for block_index, table, title in (
-            (4, coral, "Carga en Coral"),
-            (5, celra, "Carga en Celra"),
-        ):
-            block = cost_blocks[block_index]
-            if origin_zone == dest_zone and _norm_key(origin_name) in {
-                _norm_key(o) for o in FCL_ORIGINS
-            }:
-                for size in FCL_SIZE_BRACKETS:
-                    row = table.get((origin_name, size))
-                    if row:
-                        costs[cost_key(block, CostColumnSpec(size))] = row.get("cost3")
-
-        # Celra + Coral combined (40ft tariff)
-        block = cost_blocks[6]
-        if origin_zone == dest_zone:
-            row_40 = combo.get((origin_name, "40 pies")) or combo.get(
-                ("Las Palmas", "40 pies")
+            text_costs[cost_key(insurance_cc_block, insurance_cc_block.columns[0])] = str(
+                insurance_cc
             )
-            if row_40 and _norm_key(origin_name) == _norm_key("Las Palmas"):
-                costs[cost_key(block, block.columns[0])] = row_40.get("cost3")
+
+        # FCL container costs (CARGAS COMPLETAS - CONTENEDORES)
+        if origin_zone == ORIGIN_MAINLAND_SPAIN and dest_zone in FCL_ORIGINS:
+            _assign_fcl_service_costs(
+                costs,
+                blocks_by_title,
+                coral,
+                "Cargas EN CORAL",
+                port_name,
+                FCL_SIZE_BRACKETS,
+            )
+            _assign_fcl_service_costs(
+                costs,
+                blocks_by_title,
+                celra,
+                "Cargas EN CELRA",
+                port_name,
+                FCL_SIZE_BRACKETS,
+            )
+            _assign_fcl_service_costs(
+                costs,
+                blocks_by_title,
+                combo,
+                "CARGA EN CELRA / CORAL",
+                port_name,
+                ("40 pies",),
+            )
+
+            if combo.get((port_name, "40 pies")):
+                text_costs[
+                    cost_key(insurance_fcl_block, insurance_fcl_block.columns[0])
+                ] = INSURANCE_FCL_40_LABEL
 
         # Grupajes from Barcelona
         if origin_zone == ORIGIN_BARCELONA:
-            block = cost_blocks[7]
             g = None
             for key, values in grupajes.items():
                 if _norm_key(key) == _norm_key(dest_name):
                     g = values
                     break
             if g:
-                costs[cost_key(block, block.columns[0])] = g.get("per_kg")
-                costs[cost_key(block, block.columns[1])] = g.get("minimum")
-
-        # BAF from Celra+Coral and Coral/Celra tables (BAFF = cost2)
-        baf_by_origin: dict[str, dict[str, float | None]] = {}
-        for table in (coral, celra, combo):
-            for (orig, size), vals in table.items():
-                baf_by_origin.setdefault(orig, {})[size] = vals.get("cost2")
-
-        if origin_zone == dest_zone and origin_name in FCL_ORIGINS:
-            combo_baf_40 = (combo.get((origin_name, "40 pies")) or {}).get("cost2")
-            combo_baf_20 = (combo.get((origin_name, "20 pies")) or {}).get("cost2")
-            table_baf = baf_by_origin.get(origin_name, {})
-
-            block = cost_blocks[8]
-            costs[cost_key(block, block.columns[0])] = combo_baf_40 or table_baf.get(
-                "40 pies"
-            )
-
-            block = cost_blocks[9]
-            costs[cost_key(block, block.columns[0])] = combo_baf_20 or table_baf.get(
-                "20 pies"
-            )
-            costs[cost_key(block, block.columns[1])] = combo_baf_40 or table_baf.get(
-                "40 pies"
-            )
-
-            block = cost_blocks[11]
-            costs[cost_key(block, block.columns[0])] = combo_baf_40 or table_baf.get(
-                "40 pies"
-            )
-
-            block = cost_blocks[12]
-            combo_row = combo.get((origin_name, "40 pies"))
-            if combo_row:
-                costs[cost_key(block, block.columns[0])] = combo_row.get("cost3")
-
-            block = cost_blocks[13]
-            if combo.get((origin_name, "40 pies")) or (
-                _norm_key(origin_name) == _norm_key("Las Palmas")
-                and combo.get(("Las Palmas", "40 pies"))
-            ):
-                text_costs[cost_key(block, block.columns[0])] = INSURANCE_FCL_40_LABEL
+                costs[cost_key(grupajes_block, grupajes_block.columns[0])] = g.get("per_kg")
+                costs[cost_key(grupajes_block, grupajes_block.columns[1])] = g.get("minimum")
 
         matrix_rows.append(MatrixRow(shipment=shipment, costs=costs, text_costs=text_costs))
 
@@ -701,7 +736,9 @@ def write_rates_sheet(
         column_index = shipment_count + 1
         for block in cost_blocks:
             if block.uses_shared_currency:
-                worksheet.cell(row=excel_row, column=column_index, value=CURRENCY)
+                has_data = _block_has_row_data(matrix_row, block)
+                if has_data:
+                    worksheet.cell(row=excel_row, column=column_index, value=CURRENCY)
                 for offset, spec in enumerate(block.columns):
                     spec_col = column_index + 1 + offset
                     key = cost_key(block, spec)
@@ -715,7 +752,7 @@ def write_rates_sheet(
                     value = matrix_row.costs.get(key)
                     if _has_cost(value) and isinstance(value, (int, float)):
                         cell = worksheet.cell(row=excel_row, column=spec_col, value=value)
-                        cell.number_format = "0.00"
+                        cell.number_format = _excel_number_format(float(value))
                 column_index += block_column_width(block)
                 continue
 
@@ -735,7 +772,7 @@ def write_rates_sheet(
                     cell = worksheet.cell(
                         row=excel_row, column=column_index + 1, value=value
                     )
-                    cell.number_format = "0.00"
+                    cell.number_format = _excel_number_format(float(value))
                 column_index += 2
 
     for col_idx in range(1, worksheet.max_column + 1):
